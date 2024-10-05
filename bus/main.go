@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
@@ -15,8 +16,8 @@ import (
 
 var clients = []*listenerClient{}
 var msgsInMem = []EventBusMessage{}
-var wallSyncIntreval = 2 * time.Second
-var deadTime = 10 * time.Second
+var wallSyncIntreval = 10 * time.Second
+var deadTime = 20 * time.Second
 var isWriting = false
 
 type listenerClient struct {
@@ -36,6 +37,7 @@ type EventBusMessage struct {
 	SenderId string    `json:"client_id"`
 	Body     string    `json:"body"`
 	SentAt   time.Time `json:"sent_at"`
+	Id       uuid.UUID
 }
 
 func main() {
@@ -76,19 +78,17 @@ func main() {
 		}
 	}()
 
-	exitEvents := false
 	go func() {
 		quitChan := make(chan os.Signal, 1)
 		signal.Notify(quitChan, syscall.SIGINT, syscall.SIGTERM)
 		s := <-quitChan
 		log.Default().Println("caught quit signal", s.String())
-		exitEvents = true
 		writeToWall()
 		listener.Close()
 		os.Exit(0)
 	}()
 
-	for !exitEvents {
+	for {
 		con, err := listener.Accept()
 		if err != nil {
 			fmt.Println("Err accepting a connection: ", err)
@@ -116,6 +116,7 @@ func writeToInMemWall(wallChan chan []byte) error {
 			if err != nil {
 				return err
 			}
+			message.Id = uuid.New()
 
 			msgsInMem = append(msgsInMem, message)
 
@@ -190,7 +191,21 @@ func writeToWall() error {
 	}
 
 	for _, msg := range msgsInMem {
-		removedDeadOnes = append(removedDeadOnes, msg)
+		if msg.SentAt.Add(deadTime).Unix() < time.Now().Unix() {
+			continue
+		}
+
+		contains := slices.ContainsFunc(removedDeadOnes, func(m EventBusMessage) bool {
+			if m.Id == msg.Id {
+				return true
+			}
+
+			return false
+		})
+
+		if !contains {
+			removedDeadOnes = append(removedDeadOnes, msg)
+		}
 	}
 
 	inBts, err := json.Marshal(wallMessages{Messages: removedDeadOnes})
