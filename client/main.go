@@ -16,11 +16,13 @@ func main() {
 		fmt.Println("could not make client:", err)
 		return
 	}
+	defer client1.Close()
 	client2, err := NewClient("emil2", []string{topic})
 	if err != nil {
 		fmt.Println("could not make client", err)
 		return
 	}
+	defer client2.Close()
 
 	go testClientReceive(client1)
 	go testClientReceive(client2)

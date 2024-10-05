@@ -1,14 +1,21 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
 )
 
 var clients = []*listenerClient{}
+var msgsInMem = []EventBusMessage{}
+var writeEvery = 2 * time.Second
+var deadTime = 10 * time.Second
+var isWriting = false
 
 type listenerClient struct {
 	conn net.Conn
@@ -38,6 +45,7 @@ func main() {
 	}
 
 	fmt.Println("tcp listening")
+	wallChan := make(chan []byte)
 
 	go func() {
 		for {
@@ -45,6 +53,20 @@ func main() {
 			time.Sleep(3 * time.Second)
 			pruneConnections()
 			fmt.Println("pruned clients, new len", len(clients))
+		}
+	}()
+
+	go writeToInMemWall(wallChan)
+
+	go func() {
+		for {
+			time.Sleep(writeEvery)
+			fmt.Println("writing to wall")
+			err := writeToWall()
+			if err != nil {
+				fmt.Println("err writing to wall: ", err)
+			}
+			fmt.Println("done writing to wall")
 		}
 	}()
 
@@ -58,11 +80,31 @@ func main() {
 		clientConn := newListenerClient(con)
 		clients = append(clients, clientConn)
 
-		go handleClient(clientConn)
+		go handleClient(clientConn, wallChan)
 	}
 }
 
-func handleClient(listener *listenerClient) {
+func writeToInMemWall(wallChan chan []byte) error {
+	for {
+		select {
+		case msgBts, ok := <-wallChan:
+			if !ok {
+				continue
+			}
+
+			message := EventBusMessage{}
+			err := json.Unmarshal(msgBts, &message)
+			if err != nil {
+				return err
+			}
+
+			msgsInMem = append(msgsInMem, message)
+
+		}
+	}
+}
+
+func handleClient(listener *listenerClient, wallChan chan []byte) {
 	defer listener.conn.Close()
 
 	buffer := make([]byte, 1024)
@@ -73,13 +115,14 @@ func handleClient(listener *listenerClient) {
 			return
 		}
 
-		fmt.Printf("Got from conn: %s\n", buffer[:n])
+		log.Default().Printf("Got from conn: %s\n", buffer[:n])
 		for _, client := range clients {
 			if client.id != listener.id {
 				_, err := client.conn.Write(buffer[:n])
 				if err != nil {
 					fmt.Println("err broadcasting", err)
 				}
+				wallChan <- buffer[:n]
 			}
 		}
 	}
@@ -97,4 +140,51 @@ func pruneConnections() {
 	}
 
 	clients = aliveClients
+}
+
+type wallMessages struct {
+	Messages []EventBusMessage `json:"messages"`
+}
+
+func writeToWall() error {
+	data, err := os.ReadFile("wall.json")
+	if err != nil {
+		fmt.Println("err reading from wall")
+		return err
+	}
+
+	wall := wallMessages{}
+	err = json.Unmarshal(data, &wall)
+	if err != nil {
+		fmt.Println("err marshaling wall")
+		return err
+	}
+
+	removedDeadOnes := []EventBusMessage{}
+	for _, msg := range wall.Messages {
+		if msg.SentAt.Add(deadTime).Unix() < time.Now().Unix() {
+			continue
+		}
+
+		removedDeadOnes = append(removedDeadOnes, msg)
+	}
+
+	for _, msg := range msgsInMem {
+		removedDeadOnes = append(removedDeadOnes, msg)
+	}
+
+	inBts, err := json.Marshal(wallMessages{Messages: removedDeadOnes})
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile("wall.json", inBts, 0777)
+	if err != nil {
+		fmt.Println("failed to write to wall part")
+		return err
+	}
+
+	msgsInMem = []EventBusMessage{}
+
+	return nil
 }
