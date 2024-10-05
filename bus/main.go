@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,7 +15,7 @@ import (
 
 var clients = []*listenerClient{}
 var msgsInMem = []EventBusMessage{}
-var writeEvery = 2 * time.Second
+var wallSyncIntreval = 2 * time.Second
 var deadTime = 10 * time.Second
 var isWriting = false
 
@@ -43,8 +45,14 @@ func main() {
 		fmt.Println("Err starting a tcp listener:", err)
 		return
 	}
+	defer listener.Close()
 
 	fmt.Println("tcp listening")
+	err = recoverInMemWall()
+	if err != nil {
+		fmt.Println("could not recover in mem wall:", err)
+		os.Exit(1)
+	}
 	wallChan := make(chan []byte)
 
 	go func() {
@@ -60,18 +68,27 @@ func main() {
 
 	go func() {
 		for {
-			time.Sleep(writeEvery)
-			fmt.Println("writing to wall")
+			time.Sleep(wallSyncIntreval)
 			err := writeToWall()
 			if err != nil {
 				fmt.Println("err writing to wall: ", err)
 			}
-			fmt.Println("done writing to wall")
 		}
 	}()
 
-	defer listener.Close()
-	for {
+	exitEvents := false
+	go func() {
+		quitChan := make(chan os.Signal, 1)
+		signal.Notify(quitChan, syscall.SIGINT, syscall.SIGTERM)
+		s := <-quitChan
+		log.Default().Println("caught quit signal", s.String())
+		exitEvents = true
+		writeToWall()
+		listener.Close()
+		os.Exit(0)
+	}()
+
+	for !exitEvents {
 		con, err := listener.Accept()
 		if err != nil {
 			fmt.Println("Err accepting a connection: ", err)
@@ -82,6 +99,8 @@ func main() {
 
 		go handleClient(clientConn, wallChan)
 	}
+
+	return
 }
 
 func writeToInMemWall(wallChan chan []byte) error {
@@ -128,6 +147,8 @@ func handleClient(listener *listenerClient, wallChan chan []byte) {
 	}
 }
 
+func listenerCatchUp(listener *listenerClient) {}
+
 func pruneConnections() {
 	aliveClients := []*listenerClient{}
 	for _, client := range clients {
@@ -147,16 +168,15 @@ type wallMessages struct {
 }
 
 func writeToWall() error {
+	log.Default().Println("Writing to wall.")
 	data, err := os.ReadFile("wall.json")
 	if err != nil {
-		fmt.Println("err reading from wall")
 		return err
 	}
 
 	wall := wallMessages{}
 	err = json.Unmarshal(data, &wall)
 	if err != nil {
-		fmt.Println("err marshaling wall")
 		return err
 	}
 
@@ -180,11 +200,28 @@ func writeToWall() error {
 
 	err = os.WriteFile("wall.json", inBts, 0777)
 	if err != nil {
-		fmt.Println("failed to write to wall part")
 		return err
 	}
 
-	msgsInMem = []EventBusMessage{}
+	msgsInMem = removedDeadOnes
 
+	log.Default().Println("Written to wall.")
+
+	return nil
+}
+
+func recoverInMemWall() error {
+	data, err := os.ReadFile("wall.json")
+	if err != nil {
+		return err
+	}
+
+	wall := wallMessages{}
+	err = json.Unmarshal(data, &wall)
+	if err != nil {
+		return err
+	}
+
+	msgsInMem = wall.Messages
 	return nil
 }
