@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -21,6 +22,13 @@ func newListenerClient(conn net.Conn) *listenerClient {
 	}
 }
 
+type EventBusMessage struct {
+	Topic    string    `json:"topic"`
+	SenderId string    `json:"client_id"`
+	Body     string    `json:"body"`
+	SentAt   time.Time `json:"sent_at"`
+}
+
 func main() {
 	fmt.Println("starting tcp client")
 	listener, err := net.Listen("tcp", "localhost:8080")
@@ -30,6 +38,15 @@ func main() {
 	}
 
 	fmt.Println("tcp listening")
+
+	go func() {
+		for {
+			fmt.Println("curr clients:", len(clients))
+			time.Sleep(3 * time.Second)
+			pruneConnections()
+			fmt.Println("pruned clients, new len", len(clients))
+		}
+	}()
 
 	defer listener.Close()
 	for {
@@ -66,4 +83,18 @@ func handleClient(listener *listenerClient) {
 			}
 		}
 	}
+}
+
+func pruneConnections() {
+	aliveClients := []*listenerClient{}
+	for _, client := range clients {
+		_, err := client.conn.Write([]byte("ping"))
+		if err != nil {
+			continue
+		}
+
+		aliveClients = append(aliveClients, client)
+	}
+
+	clients = aliveClients
 }
