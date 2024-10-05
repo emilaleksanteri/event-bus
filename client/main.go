@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -28,6 +29,16 @@ func main() {
 	go testClientReceive(client2)
 	go testclientSend(client1)
 	go testclientSend(client2)
+
+	time.Sleep(20 * time.Second)
+	client3, err := NewClient("emil3", []string{topic})
+	if err != nil {
+		fmt.Println("could not make client", err)
+		return
+	}
+	defer client3.Close()
+	go testClientReceive(client3)
+
 	for {
 	}
 }
@@ -36,10 +47,10 @@ func testClientReceive(client *EventBusClient) {
 	for {
 		msg, err := client.Receive()
 		if err != nil {
-			fmt.Println("err receiving on name:", client.name)
+			fmt.Println("err receiving on name:", client.name, "err:", err)
 		}
 
-		fmt.Printf("msg: %+v\n", msg)
+		fmt.Printf("client: %s got a msg: %+v\n", client.name, msg)
 	}
 }
 
@@ -76,6 +87,7 @@ func (ec *EventBusClient) Write(msg EventBusMessage) error {
 		return err
 	}
 
+	inJson = append(inJson, byte('\n'))
 	_, err = ec.conn.Write(inJson)
 	if err != nil {
 		return err
@@ -96,20 +108,19 @@ func (ec *EventBusClient) Receive() (EventBusMessage, error) {
 	message := EventBusMessage{}
 
 	for {
-		buffer := make([]byte, 1024)
-		n, err := ec.conn.Read(buffer)
+		strMsg, err := bufio.NewReader(ec.conn).ReadString('\n')
 		if err != nil {
 			return EventBusMessage{}, err
 		}
 
-		bts := buffer[:n]
-		if string(bts) == "ping" {
+		if strMsg == "ping\n" || strMsg == "" {
 			continue
 		}
 
 		msg := EventBusMessage{}
-		err = json.Unmarshal(bts, &msg)
+		err = json.Unmarshal([]byte(strMsg), &msg)
 		if err != nil {
+			fmt.Println(string(strMsg))
 			return msg, err
 		}
 

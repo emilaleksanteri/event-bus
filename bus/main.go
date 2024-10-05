@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,7 +18,7 @@ import (
 var clients = []*listenerClient{}
 var msgsInMem = []EventBusMessage{}
 var wallSyncIntreval = 10 * time.Second
-var deadTime = 20 * time.Second
+var deadTime = 60 * time.Second
 var isWriting = false
 
 type listenerClient struct {
@@ -99,8 +100,6 @@ func main() {
 
 		go handleClient(clientConn, wallChan)
 	}
-
-	return
 }
 
 func writeToInMemWall(wallChan chan []byte) error {
@@ -126,35 +125,58 @@ func writeToInMemWall(wallChan chan []byte) error {
 
 func handleClient(listener *listenerClient, wallChan chan []byte) {
 	defer listener.conn.Close()
+	err := listenerCatchUp(listener)
+	if err != nil {
+		fmt.Println("err listener catch up:", err)
+		return
+	}
 
-	buffer := make([]byte, 1024)
 	for {
-		n, err := listener.conn.Read(buffer)
+		strMsg, err := bufio.NewReader(listener.conn).ReadString('\n')
 		if err != nil {
 			fmt.Println("err reading from tcp conn:", err)
 			return
 		}
+		fmt.Println(strMsg)
 
-		log.Default().Printf("Got from conn: %s\n", buffer[:n])
+		log.Default().Printf("Got from conn: %s\n", strMsg)
 		for _, client := range clients {
 			if client.id != listener.id {
-				_, err := client.conn.Write(buffer[:n])
+				_, err := client.conn.Write([]byte(strMsg))
 				if err != nil {
 					fmt.Println("err broadcasting", err)
 				}
-				wallChan <- buffer[:n]
+				wallChan <- []byte(strMsg)
 			}
 		}
 	}
 }
 
-func listenerCatchUp(listener *listenerClient) {}
+func listenerCatchUp(listener *listenerClient) error {
+	for _, msg := range msgsInMem {
+		bts, err := json.Marshal(msg)
+		if err != nil {
+			log.Default().Println("failed to marshal catch up msg to client:", err)
+			return err
+		}
+		bts = append(bts, byte('\n'))
+		_, err = listener.conn.Write(bts)
+		if err != nil {
+			log.Default().Println("failed to send catch up msg to client:", err)
+			return err
+		}
+
+	}
+
+	return nil
+}
 
 func pruneConnections() {
 	aliveClients := []*listenerClient{}
 	for _, client := range clients {
-		_, err := client.conn.Write([]byte("ping"))
+		_, err := client.conn.Write([]byte("ping\n"))
 		if err != nil {
+			client.conn.Close()
 			continue
 		}
 
