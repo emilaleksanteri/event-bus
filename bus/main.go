@@ -1,54 +1,36 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
+	"event-bus/listener"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"slices"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-var clients = []*listenerClient{}
-var msgsInMem = []EventBusMessage{}
+var clients = []*listener.ListenerClient{}
+var msgsInMem = []listener.EventBusMessage{}
 var wallSyncIntreval = 10 * time.Second
 var deadTime = 60 * time.Second
 var isWriting = false
-
-type listenerClient struct {
-	conn net.Conn
-	id   uuid.UUID
-}
-
-func newListenerClient(conn net.Conn) *listenerClient {
-	return &listenerClient{
-		conn: conn,
-		id:   uuid.New(),
-	}
-}
-
-type EventBusMessage struct {
-	Topic    string    `json:"topic"`
-	SenderId string    `json:"client_id"`
-	Body     string    `json:"body"`
-	SentAt   time.Time `json:"sent_at"`
-	Id       uuid.UUID
-}
+var mu = sync.Mutex{}
 
 func main() {
 	fmt.Println("starting tcp client")
-	listener, err := net.Listen("tcp", "localhost:8080")
+	server, err := net.Listen("tcp", "localhost:8080")
 	if err != nil {
 		fmt.Println("Err starting a tcp listener:", err)
 		return
 	}
-	defer listener.Close()
+	defer server.Close()
 
 	fmt.Println("tcp listening")
 	err = recoverInMemWall()
@@ -57,17 +39,10 @@ func main() {
 		os.Exit(1)
 	}
 	wallChan := make(chan []byte)
-
-	go func() {
-		for {
-			fmt.Println("curr clients:", len(clients))
-			time.Sleep(3 * time.Second)
-			pruneConnections()
-			fmt.Println("pruned clients, new len", len(clients))
-		}
-	}()
+	disconnectChan := make(chan string)
 
 	go writeToInMemWall(wallChan)
+	go pruneConnection(disconnectChan)
 
 	go func() {
 		for {
@@ -85,20 +60,26 @@ func main() {
 		s := <-quitChan
 		log.Default().Println("caught quit signal", s.String())
 		writeToWall()
-		listener.Close()
+		server.Close()
 		os.Exit(0)
 	}()
 
+	go func() {
+		for {
+			boradcastForListeners(disconnectChan)
+		}
+	}()
+
 	for {
-		con, err := listener.Accept()
+		con, err := server.Accept()
 		if err != nil {
 			fmt.Println("Err accepting a connection: ", err)
 			continue
 		}
-		clientConn := newListenerClient(con)
+		clientConn := listener.NewListenerClient(con)
 		clients = append(clients, clientConn)
 
-		go handleClient(clientConn, wallChan)
+		go handleClient(clientConn, wallChan, disconnectChan)
 	}
 }
 
@@ -110,7 +91,7 @@ func writeToInMemWall(wallChan chan []byte) error {
 				continue
 			}
 
-			message := EventBusMessage{}
+			message := listener.EventBusMessage{}
 			err := json.Unmarshal(msgBts, &message)
 			if err != nil {
 				return err
@@ -123,8 +104,8 @@ func writeToInMemWall(wallChan chan []byte) error {
 	}
 }
 
-func handleClient(listener *listenerClient, wallChan chan []byte) {
-	defer listener.conn.Close()
+func handleClient(listener *listener.ListenerClient, wallChan chan []byte, disconnectChan chan string) {
+	defer listener.Close()
 	err := listenerCatchUp(listener)
 	if err != nil {
 		fmt.Println("err listener catch up:", err)
@@ -132,62 +113,78 @@ func handleClient(listener *listenerClient, wallChan chan []byte) {
 	}
 
 	for {
-		strMsg, err := bufio.NewReader(listener.conn).ReadString('\n')
+		msg, err := listener.ReceiveMessage()
 		if err != nil {
-			fmt.Println("err reading from tcp conn:", err)
+			fmt.Println("err reveiving message from listener:", err)
+			disconnectChan <- listener.Id.String()
 			return
 		}
-		fmt.Println(strMsg)
 
-		log.Default().Printf("Got from conn: %s\n", strMsg)
+		log.Default().Printf("Got from conn: %s\n", string(msg))
 		for _, client := range clients {
-			if client.id != listener.id {
-				_, err := client.conn.Write([]byte(strMsg))
-				if err != nil {
-					fmt.Println("err broadcasting", err)
-				}
-				wallChan <- []byte(strMsg)
+			if client.Id != listener.Id {
+				client.AppendMessage(msg, wallChan)
 			}
 		}
 	}
 }
 
-func listenerCatchUp(listener *listenerClient) error {
+func boradcastForListeners(diconnectChan chan string) {
+	for _, client := range clients {
+		for client.CheckPendingMessages() != 0 {
+			err := client.SendPendingMessage()
+			if err != nil {
+				fmt.Println("failed to send listener msg: ", err)
+				diconnectChan <- client.Id.String()
+				break
+			}
+		}
+	}
+
+}
+
+func listenerCatchUp(client *listener.ListenerClient) error {
 	for _, msg := range msgsInMem {
+		if msg.SentAt.Add(deadTime).Unix() < time.Now().Unix() {
+			continue
+		}
 		bts, err := json.Marshal(msg)
 		if err != nil {
 			log.Default().Println("failed to marshal catch up msg to client:", err)
 			return err
 		}
-		bts = append(bts, byte('\n'))
-		_, err = listener.conn.Write(bts)
-		if err != nil {
-			log.Default().Println("failed to send catch up msg to client:", err)
-			return err
-		}
 
+		client.AppendCatchUpMessage(bts)
 	}
 
 	return nil
 }
 
-func pruneConnections() {
-	aliveClients := []*listenerClient{}
-	for _, client := range clients {
-		_, err := client.conn.Write([]byte("ping\n"))
-		if err != nil {
-			client.conn.Close()
-			continue
+func pruneConnection(disconnectChan chan string) {
+	for {
+		select {
+		case id, ok := <-disconnectChan:
+			if !ok {
+				continue
+			}
+			mu.Lock()
+
+			aliveClients := []*listener.ListenerClient{}
+			for _, client := range clients {
+				if client.Id.String() != id {
+					aliveClients = append(aliveClients, client)
+				}
+			}
+
+			clients = aliveClients
+			mu.Unlock()
 		}
 
-		aliveClients = append(aliveClients, client)
 	}
-
-	clients = aliveClients
 }
 
 type wallMessages struct {
-	Messages []EventBusMessage `json:"messages"`
+	Messages []listener.EventBusMessage `json:"messages"`
 }
 
 func writeToWall() error {
@@ -203,7 +200,7 @@ func writeToWall() error {
 		return err
 	}
 
-	removedDeadOnes := []EventBusMessage{}
+	removedDeadOnes := []listener.EventBusMessage{}
 	for _, msg := range wall.Messages {
 		if msg.SentAt.Add(deadTime).Unix() < time.Now().Unix() {
 			continue
@@ -217,7 +214,7 @@ func writeToWall() error {
 			continue
 		}
 
-		contains := slices.ContainsFunc(removedDeadOnes, func(m EventBusMessage) bool {
+		contains := slices.ContainsFunc(removedDeadOnes, func(m listener.EventBusMessage) bool {
 			if m.Id == msg.Id {
 				return true
 			}

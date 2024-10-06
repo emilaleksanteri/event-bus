@@ -48,6 +48,7 @@ func testClientReceive(client *EventBusClient) {
 		msg, err := client.Receive()
 		if err != nil {
 			fmt.Println("err receiving on name:", client.name, "err:", err)
+			continue
 		}
 
 		fmt.Printf("client: %s got a msg: %+v\n", client.name, msg)
@@ -66,6 +67,7 @@ func testclientSend(client *EventBusClient) {
 		if err != nil {
 			fmt.Println("err sending msg: ", err, "client: ", client.name)
 		}
+		fmt.Println("client", client.name, "sent")
 	}
 }
 
@@ -108,19 +110,19 @@ func (ec *EventBusClient) Receive() (EventBusMessage, error) {
 	message := EventBusMessage{}
 
 	for {
-		strMsg, err := bufio.NewReader(ec.conn).ReadString('\n')
+		btsMsg, err := bufio.NewReader(ec.conn).ReadBytes('\n')
 		if err != nil {
 			return EventBusMessage{}, err
 		}
 
-		if strMsg == "ping\n" || strMsg == "" {
+		if string(btsMsg) == "ping\n" || len(btsMsg) == 0 {
 			continue
 		}
 
 		msg := EventBusMessage{}
-		err = json.Unmarshal([]byte(strMsg), &msg)
+		err = json.Unmarshal(btsMsg, &msg)
 		if err != nil {
-			fmt.Println(string(strMsg))
+			fmt.Println(string(btsMsg))
 			return msg, err
 		}
 
